@@ -77868,11 +77868,34 @@ ArboristNode {
 
 exports[`test/arborist/build-ideal-tree.js TAP optional dependency failures > optional-dep-enotarget 1`] = `
 ArboristNode {
+  "children": Map {
+    "tap" => ArboristNode {
+      "edgesIn": Set {
+        EdgeIn {
+          "error": "INVALID",
+          "from": "",
+          "name": "tap",
+          "spec": "9999.0000.9999",
+          "type": "optional",
+        },
+      },
+      "errors": Array [
+        Object {
+          "code": "ETARGET",
+        },
+      ],
+      "location": "node_modules/tap",
+      "name": "tap",
+      "optional": true,
+      "path": "{CWD}/test/fixtures/optional-dep-enotarget/node_modules/tap",
+    },
+  },
   "edgesOut": Map {
     "tap" => EdgeOut {
+      "error": "INVALID",
       "name": "tap",
       "spec": "9999.0000.9999",
-      "to": null,
+      "to": "node_modules/tap",
       "type": "optional",
     },
   },
@@ -77887,11 +77910,32 @@ ArboristNode {
 
 exports[`test/arborist/build-ideal-tree.js TAP optional dependency failures > optional-dep-missing 1`] = `
 ArboristNode {
+  "children": Map {
+    "@isaacs/this-does-not-exist-at-all" => ArboristNode {
+      "edgesIn": Set {
+        EdgeIn {
+          "from": "",
+          "name": "@isaacs/this-does-not-exist-at-all",
+          "spec": "*",
+          "type": "optional",
+        },
+      },
+      "errors": Array [
+        Object {
+          "code": "E404",
+        },
+      ],
+      "location": "node_modules/@isaacs/this-does-not-exist-at-all",
+      "name": "@isaacs/this-does-not-exist-at-all",
+      "optional": true,
+      "path": "{CWD}/test/fixtures/optional-dep-missing/node_modules/@isaacs/this-does-not-exist-at-all",
+    },
+  },
   "edgesOut": Map {
     "@isaacs/this-does-not-exist-at-all" => EdgeOut {
       "name": "@isaacs/this-does-not-exist-at-all",
       "spec": "*",
-      "to": null,
+      "to": "node_modules/@isaacs/this-does-not-exist-at-all",
       "type": "optional",
     },
   },
@@ -77906,11 +77950,60 @@ ArboristNode {
 
 exports[`test/arborist/build-ideal-tree.js TAP optional dependency failures > optional-metadep-enotarget 1`] = `
 ArboristNode {
+  "children": Map {
+    "@isaacs/prod-dep-enotarget" => ArboristNode {
+      "children": Map {
+        "tap" => ArboristNode {
+          "edgesIn": Set {
+            EdgeIn {
+              "error": "INVALID",
+              "from": "node_modules/@isaacs/prod-dep-enotarget",
+              "name": "tap",
+              "spec": "9999.0000.9999",
+              "type": "prod",
+            },
+          },
+          "errors": Array [
+            Object {
+              "code": "ETARGET",
+            },
+          ],
+          "location": "node_modules/@isaacs/prod-dep-enotarget/node_modules/tap",
+          "name": "tap",
+          "optional": true,
+          "path": "{CWD}/test/fixtures/optional-metadep-enotarget/node_modules/@isaacs/prod-dep-enotarget/node_modules/tap",
+        },
+      },
+      "edgesIn": Set {
+        EdgeIn {
+          "from": "",
+          "name": "@isaacs/prod-dep-enotarget",
+          "spec": "*",
+          "type": "optional",
+        },
+      },
+      "edgesOut": Map {
+        "tap" => EdgeOut {
+          "error": "INVALID",
+          "name": "tap",
+          "spec": "9999.0000.9999",
+          "to": "node_modules/@isaacs/prod-dep-enotarget/node_modules/tap",
+          "type": "prod",
+        },
+      },
+      "location": "node_modules/@isaacs/prod-dep-enotarget",
+      "name": "@isaacs/prod-dep-enotarget",
+      "optional": true,
+      "path": "{CWD}/test/fixtures/optional-metadep-enotarget/node_modules/@isaacs/prod-dep-enotarget",
+      "resolved": "https://registry.npmjs.org/@isaacs/prod-dep-enotarget/-/prod-dep-enotarget-1.0.0.tgz",
+      "version": "1.0.0",
+    },
+  },
   "edgesOut": Map {
     "@isaacs/prod-dep-enotarget" => EdgeOut {
       "name": "@isaacs/prod-dep-enotarget",
       "spec": "*",
-      "to": null,
+      "to": "node_modules/@isaacs/prod-dep-enotarget",
       "type": "optional",
     },
   },
@@ -77924,11 +78017,58 @@ ArboristNode {
 
 exports[`test/arborist/build-ideal-tree.js TAP optional dependency failures > optional-metadep-missing 1`] = `
 ArboristNode {
+  "children": Map {
+    "@isaacs/testing-prod-dep-metadata-missing" => ArboristNode {
+      "children": Map {
+        "@isaacs/this-does-not-exist-at-all" => ArboristNode {
+          "edgesIn": Set {
+            EdgeIn {
+              "from": "node_modules/@isaacs/testing-prod-dep-metadata-missing",
+              "name": "@isaacs/this-does-not-exist-at-all",
+              "spec": "*",
+              "type": "prod",
+            },
+          },
+          "errors": Array [
+            Object {
+              "code": "E404",
+            },
+          ],
+          "location": "node_modules/@isaacs/testing-prod-dep-metadata-missing/node_modules/@isaacs/this-does-not-exist-at-all",
+          "name": "@isaacs/this-does-not-exist-at-all",
+          "optional": true,
+          "path": "{CWD}/test/fixtures/optional-metadep-missing/node_modules/@isaacs/testing-prod-dep-metadata-missing/node_modules/@isaacs/this-does-not-exist-at-all",
+        },
+      },
+      "edgesIn": Set {
+        EdgeIn {
+          "from": "",
+          "name": "@isaacs/testing-prod-dep-metadata-missing",
+          "spec": "*",
+          "type": "optional",
+        },
+      },
+      "edgesOut": Map {
+        "@isaacs/this-does-not-exist-at-all" => EdgeOut {
+          "name": "@isaacs/this-does-not-exist-at-all",
+          "spec": "*",
+          "to": "node_modules/@isaacs/testing-prod-dep-metadata-missing/node_modules/@isaacs/this-does-not-exist-at-all",
+          "type": "prod",
+        },
+      },
+      "location": "node_modules/@isaacs/testing-prod-dep-metadata-missing",
+      "name": "@isaacs/testing-prod-dep-metadata-missing",
+      "optional": true,
+      "path": "{CWD}/test/fixtures/optional-metadep-missing/node_modules/@isaacs/testing-prod-dep-metadata-missing",
+      "resolved": "https://registry.npmjs.org/@isaacs/testing-prod-dep-metadata-missing/-/testing-prod-dep-metadata-missing-1.0.0.tgz",
+      "version": "1.0.0",
+    },
+  },
   "edgesOut": Map {
     "@isaacs/testing-prod-dep-metadata-missing" => EdgeOut {
       "name": "@isaacs/testing-prod-dep-metadata-missing",
       "spec": "*",
-      "to": null,
+      "to": "node_modules/@isaacs/testing-prod-dep-metadata-missing",
       "type": "optional",
     },
   },
@@ -97921,6 +98061,20 @@ ArboristNode {
 }
 `
 
+exports[`test/arborist/build-ideal-tree.js TAP should take devEngines in account > must match snapshot 1`] = `
+{
+  "name": "empty-update",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "empty-update"
+    }
+  }
+}
+
+`
+
 exports[`test/arborist/build-ideal-tree.js TAP store files with a custom indenting > must match snapshot 1`] = `
 {
 	"name": "tab-indented-package-json",
@@ -97938,7 +98092,8 @@ exports[`test/arborist/build-ideal-tree.js TAP store files with a custom indenti
 		"node_modules/abbrev": {
 			"version": "1.1.1",
 			"resolved": "https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz",
-			"integrity": "sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q=="
+			"integrity": "sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==",
+			"license": "ISC"
 		}
 	}
 }
@@ -159872,6 +160027,7 @@ ArboristNode {
       "location": "node_modules/foo",
       "name": "foo",
       "path": "{CWD}/test/arborist/tap-testdir-build-ideal-tree-workspaces-should-allow-cyclic-peer-dependencies-between-workspaces-and-packages-from-a-repository/node_modules/foo",
+      "resolved": "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz",
       "version": "1.0.0",
     },
     "workspace-a" => ArboristLink {

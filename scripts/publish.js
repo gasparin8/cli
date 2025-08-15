@@ -1,75 +1,129 @@
 const semver = require('semver')
-const log = require('proc-log')
+const { log } = require('proc-log')
 const pacote = require('pacote')
-const { run, git, npm, pkg: cli, spawn } = require('./util.js')
+const { read } = require('read')
+const Table = require('cli-table3')
+const { run, git, npm, pkgPath: cliPath, pkg: cli, spawn } = require('./util.js')
+const fs = require('fs').promises
 
 const resetdeps = () => npm('run', 'resetdeps')
 
 const op = () => spawn('op', 'item', 'get', 'npm', '--otp', { out: true, ok: true })
 
-const getVersion = async (s) => {
-  const mani = await pacote.manifest(s, { preferOnline: true })
-  return mani.version
-}
-const getLatest = async (s) => {
-  const pack = await pacote.packument(s, { preferOnline: true })
-  return pack['dist-tags'].latest
-}
-
-const TAG = {
-  cli: ({ version }) => `next-${semver.major(version)}`,
-  workspace: async ({ name, version }) => {
-    const { prerelease, major } = semver.parse(version)
-    if (prerelease.length) {
-      return 'prerelease'
-    }
-    if (major === await getLatest(name).then(v => semver.major(v))) {
-      return 'latest'
-    }
-    return 'backport'
-  },
-}
-
-const needsPublish = async ({ private, name, version }, { force, getTag }) => {
-  if (private) {
-    return
+const getWorkspaceTag = async ({ name, version }) => {
+  const { prerelease, major } = semver.parse(version)
+  if (prerelease.length) {
+    return 'prerelease'
   }
 
-  const tag = await getTag({ name, version })
-  if (force || version !== await getVersion(`${name}@${tag}`)) {
-    return tag
+  const pack = await pacote.packument(name, { preferOnline: true }).catch(() => null)
+
+  if (!pack) {
+    // This might never happen but if we were to create a new workspace that has never
+    // been published before it should be set to latest right away.
+    return 'latest'
   }
+
+  if (major >= semver.major(pack['dist-tags'].latest)) {
+    // if the major version we are publishing is greater than the major version
+    // of the latest dist-tag, then this should be latest too
+    return 'latest'
+  }
+
+  // Anything else is a backport
+  return 'backport'
 }
 
-const getPublishes = async (opts) => {
-  const publish = []
+const versionNotExists = async ({ name, version }) => {
+  const spec = `${name}@${version}`
+  let exists
+  try {
+    await pacote.manifest(spec, { preferOnline: true })
+    exists = true // if it exists, no publish needed
+  } catch {
+    exists = false // otherwise its needs publishing
+  }
+  log.info(`${spec} exists=${exists}`)
+  return !exists
+}
 
-  for (const { name, pkg } of await cli.mapWorkspaces()) {
-    publish.push({
-      workspace: name,
-      tag: await needsPublish(pkg, { ...opts, getTag: TAG.workspace }),
+const getPublishes = async ({ force }) => {
+  const publishPackages = []
+
+  for (const { pkg, pkgPath } of await cli.mapWorkspaces({ public: true })) {
+    const updatePkg = async (cb) => {
+      const data = JSON.parse(await fs.readFile(pkgPath, 'utf8'))
+      const result = cb(data)
+      await fs.writeFile(pkgPath, JSON.stringify(result, null, 2))
+      return result
+    }
+
+    if (force || await versionNotExists(pkg)) {
+      publishPackages.push({
+        workspace: `--workspace=${pkg.name}`,
+        name: pkg.name,
+        version: pkg.version,
+        dependencies: pkg.dependencies,
+        devDependencies: pkg.devDependencies,
+        tag: await getWorkspaceTag(pkg),
+        updatePkg,
+      })
+    }
+  }
+
+  if (force || await versionNotExists(cli)) {
+    publishPackages.push({
+      workspace: '',
+      name: cli.name,
+      version: cli.version,
+      tag: `next-${semver.major(cli.version)}`,
+      dependencies: cli.dependencies,
+      devDependencies: cli.devDependencies,
+      updatePkg: async (cb) => {
+        const result = cb(cli)
+        await fs.writeFile(cliPath, JSON.stringify(result, null, 2))
+        return result
+      },
     })
   }
 
-  publish.push({
-    tag: await needsPublish(cli, { ...opts, getTag: TAG.cli }),
-  })
-
-  return publish.filter(p => p.tag)
+  return publishPackages
 }
 
 const main = async (opts) => {
-  const packOnly = opts.pack || opts.packDestination
-  const publishes = await getPublishes({ force: packOnly })
+  const { test, otp, dryRun, smokePublish, packDestination } = opts
+
+  const hasPackDest = !!packDestination
+  const publishes = await getPublishes({ force: smokePublish })
 
   if (!publishes.length) {
     throw new Error(
-      'Nothing to publish, exiting. ' +
+      'Nothing to publish, exiting.\n' +
       'All packages to publish should have their version bumped before running this script.'
     )
   }
 
-  log.info('publish', '\n' + publishes.map(JSON.stringify).join('\n'))
+  const table = new Table({ head: ['name', 'version', 'tag'] })
+  for (const publish of publishes) {
+    table.push([publish.name, publish.version, publish.tag])
+  }
+
+  const preformOperations = hasPackDest ? ['publish', 'pack'] : ['publish']
+
+  const confirmMessage = [
+    `Ready to ${preformOperations.join(',')} the following packages:`,
+    table.toString(),
+    smokePublish ? null : 'Ok to proceed? ',
+  ].filter(Boolean).join('\n')
+
+  if (smokePublish) {
+    log.info(confirmMessage)
+  } else {
+    const confirm = await read({ prompt: confirmMessage, default: 'y' })
+    if (confirm.trim().toLowerCase().charAt(0) !== 'y') {
+      throw new Error('Aborted')
+    }
+  }
 
   await git('clean', '-fd')
   await resetdeps()
@@ -77,7 +131,7 @@ const main = async (opts) => {
   await npm('rm', '--global', '--force', 'npm')
   await npm('link', '--force', '--ignore-scripts')
 
-  if (opts.test) {
+  if (test) {
     await npm('run', 'lint-all', '--ignore-scripts')
     await npm('run', 'postlint', '--ignore-scripts')
     await npm('run', 'test-all', '--ignore-scripts')
@@ -85,23 +139,63 @@ const main = async (opts) => {
 
   await npm('prune', '--omit=dev', '--no-save', '--no-audit', '--no-fund')
   await npm('install', '-w', 'docs', '--ignore-scripts', '--no-audit', '--no-fund')
-  await git.dirty()
 
-  for (const p of publishes) {
-    const workspace = p.workspace && `--workspace=${p.workspace}`
-    if (packOnly) {
+  if (smokePublish) {
+    log.info(`Skipping git dirty check due to local smoke publish test being run`)
+  } else {
+    await git.dirty()
+  }
+
+  let count = -1
+
+  if (smokePublish) {
+    // when we have a smoke test run we'd want to bump the version or else npm will throw an error even with dry-run
+    // this is the equivlent of running `npm version prerelease`, but ensureing all internally used workflows are bumped
+    for (const publish of publishes) {
+      const { version } = await publish.updatePkg((pkg) => ({ ...pkg, version: `${pkg.version}-smoke.0` }))
+      for (const ipublish of publishes) {
+        if (ipublish.dependencies?.[publish.name]) {
+          await ipublish.updatePkg((pkg) => ({
+            ...pkg,
+            dependencies: {
+              ...pkg.dependencies,
+              [publish.name]: version,
+            },
+          }))
+        }
+        if (ipublish.devDependencies?.[publish.name]) {
+          await ipublish.updatePkg((pkg) => ({
+            ...pkg,
+            devDependencies: {
+              ...pkg.devDependencies,
+              [publish.name]: version,
+            },
+          }))
+        }
+      }
+    }
+    await npm('install')
+  }
+
+  for (const publish of publishes) {
+    log.info(`Publishing ${publish.name}@${publish.version} to ${publish.tag} ${count++}/${publishes.length}`)
+    const workspace = publish.workspace && `--workspace=${publish.name}`
+    const publishPkg = (...args) => npm('publish', workspace, `--tag=${publish.tag}`, ...args)
+
+    if (hasPackDest) {
       await npm(
         'pack',
         workspace,
-        opts.packDestination && `--pack-destination=${opts.packDestination}`
+        packDestination && `--pack-destination=${packDestination}`
       )
+    }
+
+    if (smokePublish) {
+      await publishPkg('--dry-run', '--ignore-scripts')
     } else {
-      await npm(
-        'publish',
-        workspace,
-        `--tag=${p.tag}`,
-        opts.dryRun && '--dry-run',
-        opts.otp && `--otp=${opts.otp === 'op' ? await op() : opts.otp}`
+      await publishPkg(
+        dryRun && '--dry-run',
+        otp && `--otp=${otp === 'op' ? await op() : otp}`
       )
     }
   }

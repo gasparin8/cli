@@ -13,13 +13,13 @@ When submitting a new bug report, please first [search](https://github.com/npm/c
 **1. Clone this repository...**
 
 ```bash
-$ git clone git@github.com:npm/cli.git npm
+git clone git@github.com:npm/cli.git npm
 ```
 
 **2. Navigate into project & install development-specific dependencies...**
 
 ```bash
-$ cd ./npm && node . install
+cd ./npm && node ./scripts/resetdeps.js
 ```
 
 **3. Write some code &/or add some tests...**
@@ -30,7 +30,7 @@ $ cd ./npm && node . install
 
 **4. Run tests & ensure they pass...**
 ```
-$ node . run test
+node . run test
 ```
 
 **5. Open a [Pull Request](https://github.com/npm/cli/pulls) for your work & become the newest contributor to `npm`! 🎉**
@@ -47,6 +47,31 @@ We use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).  
 ## Test Coverage
 
 We use [`tap`](https://node-tap.org/) for testing & expect that every new feature or bug fix comes with corresponding tests that validate the solutions. Tap also reports on code coverage and it will fail if that drops below 100%.
+
+To run your repository's version of the npm cli on your local machine use the following commands:
+
+**npm commands:**
+```bash
+node . <command>
+```
+
+**npx commands:**
+```bash
+node . exec
+```
+
+For example instead of:
+```bash
+npm exec -- <package>
+```
+Use:
+```bash
+node . exec -- <package>
+```
+To update the snapshots run:
+```bash
+TAP_SNAPSHOT=1 node . run test
+```
 
 ## Performance & Benchmarks
 

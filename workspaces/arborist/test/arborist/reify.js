@@ -1,47 +1,20 @@
-const { join, resolve, basename } = require('path')
+const { join, resolve, basename } = require('node:path')
 const t = require('tap')
 const runScript = require('@npmcli/run-script')
 const localeCompare = require('@isaacs/string-locale-compare')('en')
+// TODO mock registry (will require several because of differing hosts
 const tnock = require('../fixtures/tnock')
-const fs = require('fs')
-const fsp = require('fs/promises')
+const fs = require('node:fs')
+const fsp = require('node:fs/promises')
 const npmFs = require('@npmcli/fs')
+const MockRegistry = require('@npmcli/mock-registry')
+const { dirname, relative } = require('node:path')
 
 let failRm = false
 let failRename = null
 let failRenameOnce = null
 let failMkdir = null
-const { rename: realRename, rm: realRm, mkdir: realMkdir } = fs
-const fsMock = {
-  ...fs,
-  mkdir (...args) {
-    if (failMkdir) {
-      process.nextTick(() => args.pop()(failMkdir))
-      return
-    }
 
-    return realMkdir(...args)
-  },
-  rename (...args) {
-    if (failRename) {
-      process.nextTick(() => args.pop()(failRename))
-    } else if (failRenameOnce) {
-      const er = failRenameOnce
-      failRenameOnce = null
-      process.nextTick(() => args.pop()(er))
-    } else {
-      return realRename(...args)
-    }
-  },
-  rm (...args) {
-    if (failRm) {
-      process.nextTick(() => args.pop()(new Error('rm fail')))
-      return
-    }
-
-    realRm(...args)
-  },
-}
 const fspMock = {
   ...fsp,
   mkdir: async (...args) => {
@@ -70,11 +43,11 @@ const fspMock = {
     return fsp.rm(...args)
   },
 }
+
 // need this to be injected so that it doesn't pull from main cache
 const { moveFile } = t.mock('@npmcli/fs', { 'fs/promises': fspMock })
 const mocks = {
-  fs: fsMock,
-  'fs/promises': fspMock,
+  'node:fs/promises': fspMock,
   '@npmcli/fs': { ...npmFs, moveFile },
 }
 
@@ -101,6 +74,16 @@ const warningTracker = () => {
   }
 }
 
+const outputTracker = () => {
+  const list = []
+  const onlog = (...msg) => msg[0] === 'standard' && list.push(msg)
+  process.on('output', onlog)
+  return () => {
+    process.removeListener('output', onlog)
+    return list
+  }
+}
+
 const debugLogTracker = () => {
   const list = []
   mockDebug.log = (...msg) => list.push(msg)
@@ -111,7 +94,7 @@ const debugLogTracker = () => {
 }
 const mockDebug = Object.assign(fn => fn(), { log: () => {} })
 
-const Arborist = t.mock('../../lib/index.js', {
+const Arborist = t.mock('../..', {
   ...mocks,
   // need to not mock this one, so we still can swap the process object
   '../../lib/signal-handling.js': require('../../lib/signal-handling.js'),
@@ -123,18 +106,6 @@ const Arborist = t.mock('../../lib/index.js', {
 const { Node, Link, Shrinkwrap } = Arborist
 
 const {
-  start,
-  stop,
-  registry,
-  advisoryBulkResponse,
-} = require('../fixtures/server.js')
-
-t.before(start)
-t.teardown(stop)
-
-const cache = t.testdir()
-
-const {
   normalizePath,
   normalizePaths,
   printTree,
@@ -142,59 +113,86 @@ const {
 
 const cwd = normalizePath(process.cwd())
 t.cleanSnapshot = s => s.split(cwd).join('{CWD}')
-  .split(registry).join('https://registry.npmjs.org/')
 
 const fixture = (t, p) => require('../fixtures/reify-cases/' + p)(t)
 
 const printReified = (path, opt) => reify(path, opt).then(printTree)
+const fixtures = join(__dirname, '..', 'fixtures')
+const createRegistry = (t, mocks) => {
+  const registry = new MockRegistry({
+    strict: true,
+    tap: t,
+    registry: 'https://registry.npmjs.org',
+  })
+  if (mocks) {
+    registry.mocks({ dir: join(__dirname, '..', 'fixtures') })
+  }
+  return registry
+}
 
 const newArb = (opt) => new Arborist({
   audit: false,
-  cache,
-  registry,
+  cache: opt.path,
   // give it a very long timeout so CI doesn't crash as easily
   timeout: 30 * 60 * 1000,
   ...opt,
 })
 
-const reify = (path, opt) => newArb({ path, ...(opt || {}) }).reify(opt)
+const reify = (path, opt = {}) => newArb({ path, ...opt }).reify(opt)
 
-t.test('tarball deps with transitive tarball deps', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'tarball-dependencies'))))
+t.test('bundled file dep with same name as other dep', async t => {
+  const registry = createRegistry(t)
+  registry.mocks({ dir: fixtures })
+  const tree = await printReified(fixture(t, 'conflict-bundle-file-dep'))
+  t.matchSnapshot(tree)
+})
+
+t.test('tarball deps with transitive tarball deps', async t => {
+  createRegistry(t)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'tarball-dependencies')))
+})
 
 t.test('update a yarn.lock file', async t => {
   const path = fixture(t, 'yarn-lock-mkdirp')
+  createRegistry(t, true)
   const tree = await reify(path, { add: ['abbrev'] })
   t.matchSnapshot(printTree(tree), 'add abbrev')
   t.matchSnapshot(fs.readFileSync(path + '/yarn.lock', 'utf8'), 'updated yarn lock')
 })
 
-t.test('weirdly broken lockfile without resolved value', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'dep-missing-resolved'))))
+t.test('weirdly broken lockfile without resolved value', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'dep-missing-resolved')))
+})
 
-t.test('testing-peer-deps package', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps'))))
+t.test('testing-peer-deps package', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps')))
+})
 
-t.test('just the shrinkwrap', t => {
-  const paths = [
-    'cli-750-fresh',
-    'yarn-lock-mkdirp',
-  ]
-  t.plan(paths.length)
-  for (const p of paths) {
-    t.test(p, async t => {
-      const path = fixture(t, p)
-      const arb = newArb({ path, audit: true, packageLockOnly: true })
-      await arb.reify()
-      t.ok(arb.auditReport, 'got an audit report')
-      t.throws(() => fs.statSync(path + '/node_modules'), { code: 'ENOENT' })
-      t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'))
-    })
-  }
+t.test('just the shrinkwrap', async t => {
+  await t.test('cli-750-fresh', async t => {
+    const path = fixture(t, 'cli-750-fresh')
+    createRegistry(t, false)
+    const arb = newArb({ path, audit: true, packageLockOnly: true })
+    await arb.reify()
+    t.throws(() => fs.statSync(path + '/node_modules'), { code: 'ENOENT' })
+    t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'))
+  })
+  await t.test('yarn-lock-mkdirp', async t => {
+    const path = fixture(t, 'yarn-lock-mkdirp')
+    const registry = createRegistry(t, true)
+    registry.audit({})
+    const arb = newArb({ path, audit: true, packageLockOnly: true })
+    await arb.reify()
+    t.throws(() => fs.statSync(path + '/node_modules'), { code: 'ENOENT' })
+    t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'))
+  })
 })
 
 t.test('packageLockOnly can add deps', async t => {
   const path = t.testdir({ 'package.json': '{}' })
+  createRegistry(t, true)
   await reify(path, { add: ['abbrev'], packageLockOnly: true })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
   t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'))
@@ -205,6 +203,7 @@ t.test('malformed package.json should not be overwitten', async t => {
   t.plan(2)
 
   const path = fixture(t, 'malformed-json')
+  createRegistry(t, false)
   const originalContent = fs.readFileSync(path + '/package.json', 'utf8')
 
   try {
@@ -223,25 +222,27 @@ t.test('malformed package.json should not be overwitten', async t => {
 
 t.test('packageLockOnly does not work on globals', t => {
   const path = t.testdir({ 'package.json': '{}' })
+  createRegistry(t, false)
   return t.rejects(() => reify(path, { global: true, packageLockOnly: true }))
 })
 
 t.test('omit peer deps', t => {
   const path = fixture(t, 'testing-peer-deps')
+  createRegistry(t, true)
   // in this one we also snapshot the timers, mostly just as a smoke test
   const timers = {}
   const finishedTimers = []
-  const onTime = name => {
-    t.notOk(timers[name], 'should not have duplicated timers started')
-    timers[name] = true
-  }
-  const onTimeEnd = name => {
-    t.ok(timers[name], 'should not end unstarted timer')
-    delete timers[name]
-    finishedTimers.push(name)
+  const onTime = (level, name) => {
+    if (level === 'start') {
+      t.notOk(timers[name], 'should not have duplicated timers started')
+      timers[name] = true
+    } else if (level === 'end') {
+      t.ok(timers[name], 'should not end unstarted timer')
+      delete timers[name]
+      finishedTimers.push(name)
+    }
   }
   process.on('time', onTime)
-  process.on('timeEnd', onTimeEnd)
 
   return reify(path, { omit: ['peer'] })
     .then(tree => {
@@ -262,27 +263,33 @@ t.test('omit peer deps', t => {
   // eslint-disable-next-line promise/always-return
     .then(() => {
       process.removeListener('time', onTime)
-      process.removeListener('timeEnd', onTimeEnd)
       finishedTimers.sort(localeCompare)
       t.matchSnapshot(finishedTimers, 'finished timers')
       t.strictSame(timers, {}, 'should have no timers in progress now')
     })
 })
 
-t.test('testing-peer-deps nested', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps-nested'))))
+t.test('testing-peer-deps nested', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps-nested')))
+})
 
-t.test('a workspace with a duplicated nested conflicted dep', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'workspace4'))))
+t.test('a workspace with a duplicated nested conflicted dep', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'workspace4')))
+})
 
-t.test('testing-peer-deps nested with update', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps-nested'), {
+t.test('testing-peer-deps nested with update', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps-nested'), {
     update: { names: ['@isaacs/testing-peer-deps'] },
     save: false,
-  })))
+  }))
+})
 
 t.test('update a bundling node without updating all of its deps', t => {
   const path = fixture(t, 'tap-react15-collision-legacy-sw')
+  createRegistry(t, true)
 
   // check that it links the bin
   const bin = resolve(path, 'node_modules/.bin/tap')
@@ -311,6 +318,7 @@ t.test('update a bundling node without updating all of its deps', t => {
 t.test('Bundles rebuilt as long as rebuildBundle not false', async t => {
   t.test('rebuild the bundle', async t => {
     const path = fixture(t, 'testing-rebuild-bundle')
+    createRegistry(t, true)
     const a = resolve(path, 'node_modules/@isaacs/testing-rebuild-bundle-a')
     const dir = resolve(a, 'node_modules/@isaacs/testing-rebuild-bundle-b')
     const file = resolve(dir, 'cwd')
@@ -319,6 +327,7 @@ t.test('Bundles rebuilt as long as rebuildBundle not false', async t => {
   })
   t.test('do not rebuild the bundle', async t => {
     const path = fixture(t, 'testing-rebuild-bundle')
+    createRegistry(t, true)
     const a = resolve(path, 'node_modules/@isaacs/testing-rebuild-bundle-a')
     const dir = resolve(a, 'node_modules/@isaacs/testing-rebuild-bundle-b')
     const file = resolve(dir, 'cwd')
@@ -329,6 +338,7 @@ t.test('Bundles rebuilt as long as rebuildBundle not false', async t => {
 
 t.test('transitive deps containing asymmetrical bin no lockfile', t => {
   const path = fixture(t, 'testing-asymmetrical-bin-no-lock')
+  createRegistry(t, true)
 
   // check that it links the bin
   const bin = resolve(path, 'node_modules/.bin/b')
@@ -343,6 +353,7 @@ t.test('transitive deps containing asymmetrical bin no lockfile', t => {
 
 t.test('transitive deps containing asymmetrical bin with lockfile', t => {
   const path = fixture(t, 'testing-asymmetrical-bin-with-lock')
+  createRegistry(t, true)
 
   // check that it links the bin
   const bin = resolve(path, 'node_modules/.bin/b')
@@ -356,9 +367,9 @@ t.test('transitive deps containing asymmetrical bin with lockfile', t => {
 
 t.test('omit optional dep', t => {
   const path = fixture(t, 'tap-react15-collision-legacy-sw')
-  const ignoreScripts = true
+  createRegistry(t, true)
 
-  const arb = newArb({ path, ignoreScripts })
+  const arb = newArb({ path, ignoreScripts: true })
   // eslint-disable-next-line promise/always-return
   return arb.reify({ omit: ['optional'] }).then(tree => {
     t.equal(tree.children.get('fsevents'), undefined, 'no fsevents in tree')
@@ -375,27 +386,34 @@ t.test('dev, optional, devOptional flags and omissions', t => {
   const path = 'testing-dev-optional-flags'
   const omits = [['dev'], ['dev', 'optional'], ['optional']]
   t.plan(omits.length)
-  omits.forEach(omit => t.test(omit.join(','), t =>
-    t.resolveMatchSnapshot(printReified(fixture(t, path), {
+  omits.forEach(omit => t.test(omit.join(','), async t => {
+    createRegistry(t, true)
+    await t.resolveMatchSnapshot(printReified(fixture(t, path), {
       omit,
-    }))))
+    }))
+  }))
 })
 
 t.test('omits when both dev and optional flags are set', t => {
   const path = 'testing-dev-optional-flags-2'
   const omits = [['dev'], ['optional']]
   t.plan(omits.length)
-  omits.forEach(omit => t.test(omit.join(','), t =>
-    t.resolveMatchSnapshot(printReified(fixture(t, path), {
+  omits.forEach(omit => t.test(omit.join(','), async t => {
+    createRegistry(t, true)
+    await t.resolveMatchSnapshot(printReified(fixture(t, path), {
       omit,
-    }))))
+    }))
+  }))
 })
 
-t.test('bad shrinkwrap file', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps-bad-sw'))))
+t.test('bad shrinkwrap file', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'testing-peer-deps-bad-sw')))
+})
 
 t.test('multiple bundles at the same level', t => {
   const path = fixture(t, 'two-bundled-deps')
+  createRegistry(t, true)
   const a = newArb({ path })
   return a.reify().then(tree => {
     const root = tree.root
@@ -417,23 +435,28 @@ t.test('multiple bundles at the same level', t => {
   })
 })
 
-t.test('update a node without updating its children', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'once-outdated'),
-    { update: { names: ['once'] }, save: false })))
+t.test('update a node without updating its children', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'once-outdated'),
+    { update: { names: ['once'] }, save: false }))
+})
 
-t.test('do not add shrinkwrapped deps', t =>
-  t.resolveMatchSnapshot(printReified(
-    fixture(t, 'shrinkwrapped-dep-no-lock'), { update: true })))
+t.test('do not add shrinkwrapped deps', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(
+    fixture(t, 'shrinkwrapped-dep-no-lock'), { update: true }))
+})
 
-t.test('do not update shrinkwrapped deps', t =>
-  t.resolveMatchSnapshot(printReified(
+t.test('do not update shrinkwrapped deps', async t => {
+  createRegistry(t, false)
+  await t.resolveMatchSnapshot(printReified(
     fixture(t, 'shrinkwrapped-dep-with-lock'),
-    { update: { names: ['abbrev'] } })))
+    { update: { names: ['abbrev'] } }))
+})
 
 t.test('tracks changes of shrinkwrapped dep correctly', async t => {
-  const path = t.testdir({
-    'package.json': '{}',
-  })
+  const path = t.testdir({ 'package.json': '{}' })
+  createRegistry(t, true)
 
   const install1 = await printReified(path, { add: ['@nlf/shrinkwrapped-dep-updates-a@1.0.0'] })
   t.matchSnapshot(install1, 'install added the correct tree')
@@ -453,46 +476,78 @@ t.test('tracks changes of shrinkwrapped dep correctly', async t => {
   t.match(repair, install2, 'tree got repaired')
 })
 
-t.test('do not install optional deps with mismatched platform specifications', t =>
-  t.resolveMatchSnapshot(printReified(
-    fixture(t, 'optional-platform-specification'))))
+t.test('do not install optional deps with mismatched platform specifications', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'optional-platform-specification')))
+})
 
-t.test('still do not install optional deps with mismatched platform specifications even when forced', t =>
-  t.resolveMatchSnapshot(printReified(
-    fixture(t, 'optional-platform-specification'), { force: true })))
+t.test('still do not install optional deps with mismatched platform specifications even when forced', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'optional-platform-specification'), { force: true }))
+})
 
-t.test('fail to install deps with mismatched platform specifications', t =>
-  t.rejects(printReified(fixture(t, 'platform-specification')), { code: 'EBADPLATFORM' }))
+t.test('fail to install deps with mismatched platform specifications', async t => {
+  createRegistry(t, true)
+  await t.rejects(printReified(fixture(t, 'platform-specification')), { code: 'EBADPLATFORM' })
+})
+
+t.test('success to install optional deps with matched platform specifications with os and cpu and libc options', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(
+    fixture(t, 'optional-platform-specification'), { os: 'not-your-os', cpu: 'not-your-cpu', libc: 'not-your-libc' }))
+})
+
+t.test('fail to install optional deps with matched os and mismatched cpu with os and cpu and libc options', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(
+    fixture(t, 'optional-platform-specification'), { os: 'not-your-os', cpu: 'another-cpu', libc: 'not-your-libc' }))
+})
+
+t.test('fail to install optional deps with mismatched os and matched cpu with os and cpu and libc options', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(
+    fixture(t, 'optional-platform-specification'), { os: 'another-os', cpu: 'not-your-cpu', libc: 'not-your-libc' }))
+})
+
+t.test('fail to install optional deps with matched os and matched cpu and mismatched libc with os and cpu and libc options', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(
+    fixture(t, 'optional-platform-specification'), { os: 'another-os', cpu: 'not-your-cpu', libc: 'not-your-libc' }))
+})
 
 t.test('dry run, do not get anything wet', async t => {
   const cases = [
-    'shrinkwrapped-dep-with-lock-empty',
-    'shrinkwrapped-dep-no-lock-empty',
-    'link-dep-empty',
-    'link-meta-deps-empty',
-    'testing-bundledeps-empty',
+    ['shrinkwrapped-dep-with-lock-empty', false],
+    ['shrinkwrapped-dep-no-lock-empty', true],
+    ['link-dep-empty', false],
+    ['link-meta-deps-empty', true],
+    ['testing-bundledeps-empty', true],
   ]
   t.plan(cases.length)
-  cases.forEach(c => t.test(c, async t => {
-    const path = fixture(t, c)
-    const arb = newArb({ path, dryRun: true })
-    t.matchSnapshot(printTree(await arb.reify()))
-    t.throws(() => fs.statSync(resolve(path, 'node_modules')))
-    t.ok(arb.diff)
-  }))
+  for (const [c, mocks] of cases) {
+    await t.test(c, async t => {
+      const path = fixture(t, c)
+      createRegistry(t, mocks)
+      const arb = newArb({ path, dryRun: true })
+      t.matchSnapshot(printTree(await arb.reify()))
+      t.throws(() => fs.statSync(resolve(path, 'node_modules')))
+      t.ok(arb.diff)
+    })
+  }
 })
 
 t.test('reifying with shronk warp dep', t => {
   const cases = [
-    'shrinkwrapped-dep-with-lock',
-    'shrinkwrapped-dep-with-lock-empty',
-    'shrinkwrapped-dep-no-lock',
-    'shrinkwrapped-dep-no-lock-empty',
+    ['shrinkwrapped-dep-with-lock', false],
+    ['shrinkwrapped-dep-with-lock-empty', true],
+    ['shrinkwrapped-dep-no-lock', true],
+    ['shrinkwrapped-dep-no-lock-empty', true],
   ]
   t.plan(cases.length)
-  for (const c of cases) {
+  for (const [c, mocks] of cases) {
     t.test(c, async t => {
       const path = fixture(t, c)
+      createRegistry(t, mocks)
       const tree = await printReified(path, {
         // set update so that we don't start the idealTree
         // with the actualTree, and can see that the deps
@@ -506,40 +561,61 @@ t.test('reifying with shronk warp dep', t => {
   }
 })
 
-t.test('link deps already in place', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'link-dep'))))
-t.test('create link deps', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'link-dep-empty'))))
+t.test('link deps already in place', async t => {
+  createRegistry(t, false)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'link-dep')))
+})
 
-t.test('link meta deps, fresh install', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'link-meta-deps-empty'))))
-t.test('link meta deps, update', t =>
-  t.resolveMatchSnapshot(printReified(fixture(t, 'link-meta-deps'), {
+t.test('create link deps', async t => {
+  createRegistry(t, false)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'link-dep-empty')))
+})
+
+t.test('link meta deps, fresh install', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'link-meta-deps-empty')))
+})
+
+t.test('link meta deps, update', async t => {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(fixture(t, 'link-meta-deps'), {
     // use legacy nesting so we leave the link nested
     legacyNesting: true,
     add: [
       '@isaacs/testing-link-dep@2',
       '@isaacs/testing-link-dev-dep@2',
     ],
-  })))
+  }))
+})
 
-t.test('update a child of a node with bundled deps', t => {
+t.test('update a child of a node with bundled deps', async t => {
   const path = fixture(t, 'testing-bundledeps-legacy-bundling')
-  return t.resolveMatchSnapshot(printReified(path, {
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(path, {
     update: ['@isaacs/testing-bundledeps-c'],
     installStrategy: 'nested',
   }))
 })
 
-t.test('update a node without updating a child that has bundle deps', t => {
-  const path = fixture(t, 'testing-bundledeps-3')
-  return t.resolveMatchSnapshot(printReified(path, {
+t.test('update a node without updating an inert child bundle deps', async t => {
+  const path = fixture(t, 'testing-bundledeps-4')
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(path, {
     update: ['@isaacs/testing-bundledeps-parent'],
     save: false,
   }))
 })
 
-t.test('optional dependency failures', t => {
+t.test('update a node without updating a child that has bundle deps', async t => {
+  const path = fixture(t, 'testing-bundledeps-3')
+  createRegistry(t, true)
+  await t.resolveMatchSnapshot(printReified(path, {
+    update: ['@isaacs/testing-bundledeps-parent'],
+    save: false,
+  }))
+})
+
+t.test('optional dependency failures', async t => {
   const cases = [
     'optional-dep-tgz-missing',
     'optional-metadep-tgz-missing',
@@ -552,22 +628,28 @@ t.test('optional dependency failures', t => {
     'optional-metadep-postinstall-fail',
     'optional-metadep-allinstall-fail',
   ]
-  t.plan(cases.length * 2)
-  let p = [...cases.map(c => t.test(`${c} save=false`, t =>
-    t.resolveMatchSnapshot(printReified(fixture(t, c),
-      { update: true, save: false }))))]
-
-  // npm update --save
-  p = [...cases.map(c => t.test(`${c} save=true`, t =>
-    t.resolveMatchSnapshot(printReified(fixture(t, c),
-      { update: true, save: true }))))]
-  return p
+  // t.plan(cases.length * 2)
+  for (const c of cases) {
+    await t.test(`${c} save=false`, async t => {
+      createRegistry(t, true)
+      await t.resolveMatchSnapshot(printReified(fixture(t, c),
+        { update: true, save: false }))
+    })
+    // npm update --save
+    await t.test(`${c} save=true`, async t => {
+      createRegistry(t, true)
+      await t.resolveMatchSnapshot(printReified(fixture(t, c),
+        { update: true, save: true }))
+    })
+  }
 })
 
-t.test('failure to fetch prod dep is failure', t =>
-  t.rejects(printReified(fixture(t, 'prod-dep-tgz-missing'))))
+t.test('failure to fetch prod dep is failure', async t => {
+  createRegistry(t, true)
+  t.rejects(printReified(fixture(t, 'prod-dep-tgz-missing')))
+})
 
-t.test('failing script means install failure, unless ignoreScripts', t => {
+t.test('failing script means install failure, unless ignoreScripts', async t => {
   const cases = [
     'prod-dep-preinstall-fail',
     'prod-dep-install-fail',
@@ -575,28 +657,34 @@ t.test('failing script means install failure, unless ignoreScripts', t => {
     'prod-dep-allinstall-fail',
   ]
 
-  t.plan(cases.length * 2)
-
-  cases.forEach(c => {
-    t.test(c, t =>
-      t.rejects(printReified(fixture(t, c))))
-    t.test(c + ' --ignore-scripts', t =>
-      t.resolveMatchSnapshot(printReified(
-        fixture(t, c), { ignoreScripts: true })))
-  })
+  for (const c of cases) {
+    await t.test(c, async t => {
+      createRegistry(t, true)
+      t.rejects(printReified(fixture(t, c)))
+    })
+    await t.test(`${c} --ignore-scripts`, async t => {
+      createRegistry(t, true)
+      await t.resolveMatchSnapshot(printReified(
+        fixture(t, c), { ignoreScripts: true }))
+    })
+  }
 })
 
-t.test('link metadep', t => {
+t.test('link metadep', async t => {
   const cases = [
     'cli-750',
     'cli-750-fresh',
   ]
-  t.plan(cases.length)
-  cases.forEach(c => t.test(c, t =>
-    t.resolveMatchSnapshot(printReified(fixture(t, c)))))
+  for (const c of cases) {
+    createRegistry(t, false)
+    await t.test(c, async t => {
+      t.resolveMatchSnapshot(printReified(fixture(t, c)))
+    })
+  }
 })
 
 t.test('warn on reifying deprecated dependency', t => {
+  createRegistry(t, true)
   const a = newArb({
     path: fixture(t, 'deprecated-dep'),
     lockfileVersion: 1,
@@ -616,6 +704,7 @@ t.test('warn on reifying deprecated dependency', t => {
 t.test('rollbacks', { buffered: false }, t => {
   t.test('fail retiring shallow nodes', t => {
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const expect = new Error('rename fail')
     const kRenamePath = Symbol.for('renamePath')
@@ -643,6 +732,7 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail retiring nodes because rm fails after eexist', t => {
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const eexist = new Error('rename fail')
     eexist.code = 'EEXIST'
@@ -680,6 +770,7 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail retiring node, but then rm fixes it', async t => {
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const eexist = new Error('rename fail')
     eexist.code = 'EEXIST'
@@ -708,6 +799,7 @@ t.test('rollbacks', { buffered: false }, t => {
   t.test('fail creating sparse tree', t => {
     t.teardown(() => failMkdir = null)
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const kCreateST = Symbol.for('createSparseTree')
     const createSparseTree = a[kCreateST]
@@ -733,6 +825,7 @@ t.test('rollbacks', { buffered: false }, t => {
     failMkdir = null
     failRm = null
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
 
     const kCreateST = Symbol.for('createSparseTree')
@@ -761,7 +854,7 @@ t.test('rollbacks', { buffered: false }, t => {
     const check = warningTracker()
     return t.rejects(a.reify({
       update: ['@isaacs/testing-bundledeps-parent'],
-    }).then(tree => 'it worked'), new Error('poop'))
+    }).then(() => 'it worked'), new Error('poop'))
     // eslint-disable-next-line promise/always-return
       .then(() => {
         const warnings = check()
@@ -781,6 +874,7 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail loading shrinkwraps and updating trees', t => {
     const path = fixture(t, 'shrinkwrapped-dep-no-lock-empty')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const kLoadSW = Symbol.for('loadShrinkwrapsAndUpdateTrees')
     const loadShrinkwrapsAndUpdateTrees = a[kLoadSW]
@@ -807,13 +901,14 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail loading bundles and updating trees', t => {
     const path = fixture(t, 'two-bundled-deps')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const kLoadBundles = Symbol.for('loadBundlesAndUpdateTrees')
     const loadBundlesAndUpdateTrees = a[kLoadBundles]
     a[kLoadBundles] = (depth, bundlesByDepth) => {
       const kRN = Symbol.for('reifyNode')
       const reifyNode = a[kRN]
-      a[kRN] = node => {
+      a[kRN] = () => {
         a[kRN] = reifyNode
         return Promise.reject(new Error('poop'))
       }
@@ -825,13 +920,14 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail unpacking new modules', t => {
     const path = fixture(t, 'two-bundled-deps')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const kUnpack = Symbol.for('unpackNewModules')
     const unpackNewModules = a[kUnpack]
     a[kUnpack] = () => {
       const kReify = Symbol.for('reifyNode')
       const reifyNode = a[kReify]
-      a[kReify] = node => {
+      a[kReify] = () => {
         a[kReify] = reifyNode
         return Promise.reject(new Error('poop'))
       }
@@ -843,6 +939,7 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail moving back retired unchanged', t => {
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const kMoveback = Symbol.for('moveBackRetiredUnchanged')
 
@@ -871,6 +968,7 @@ t.test('rollbacks', { buffered: false }, t => {
 
   t.test('fail removing retired and deleted nodes', t => {
     const path = fixture(t, 'testing-bundledeps-3')
+    createRegistry(t, true)
     const a = newArb({ path, installStrategy: 'nested' })
     const kRemove = Symbol.for('removeTrash')
     const removeRetiredAndDeletedNodes = a[kRemove]
@@ -907,6 +1005,7 @@ t.test('rollbacks', { buffered: false }, t => {
 t.test('saving the ideal tree', t => {
   const kSaveIdealTree = Symbol.for('saveIdealTree')
   t.test('save=false', async t => {
+    createRegistry(t, false)
     // doesn't actually do anything, just for coverage.
     // if it wasn't an early exit, it'd blow up and throw
     // an error though.
@@ -916,6 +1015,7 @@ t.test('saving the ideal tree', t => {
   })
 
   t.test('save some stuff', t => {
+    createRegistry(t, false)
     const pkg = {
       bundleDependencies: ['a', 'b', 'c'],
       dependencies: {
@@ -1077,6 +1177,7 @@ t.test('saving the ideal tree', t => {
 t.test('scoped registries', async t => {
   const path = t.testdir()
 
+  // TODO
   // this is a very artifical test that is setting a lot of internal things
   // up so that we assert that the intended behavior of sending right
   // resolved data for pacote.extract is working as intended, alternatively
@@ -1100,8 +1201,7 @@ t.test('scoped registries', async t => {
   const a = new ArboristMock({
     audit: false,
     path,
-    cache,
-    registry,
+    cache: path,
   })
   const kReify = Symbol.for('reifyNode')
   a.addTracker('reify')
@@ -1131,6 +1231,7 @@ t.test('bin links adding and removing', t => {
 
 t.test('global style', t => {
   const path = t.testdir()
+  createRegistry(t, true)
   const nm = resolve(path, 'node_modules')
   const rbinPart = '.bin/rimraf' +
     (process.platform === 'win32' ? '.cmd' : '')
@@ -1140,7 +1241,7 @@ t.test('global style', t => {
     .then(() => t.strictSame(fs.readdirSync(nm).sort(), ['.bin', '.package-lock.json', 'rimraf']))
 })
 
-t.test('global', t => {
+t.test('global', async t => {
   const isWindows = process.platform === 'win32'
 
   const path = t.testdir({ lib: {} })
@@ -1151,50 +1252,122 @@ t.test('global', t => {
   const rimrafBin = resolve(binTarget, isWindows ? 'rimraf.cmd' : 'rimraf')
   const semverBin = resolve(binTarget, isWindows ? 'semver.cmd' : 'semver')
 
-  t.test('add rimraf', t =>
-    reify(lib, { add: ['rimraf@2'], global: true })
+  await t.test('add rimraf', async t => {
+    createRegistry(t, true)
+    await reify(lib, { add: ['rimraf@2'], global: true })
       .then(() => fs.statSync(rimrafBin))
-      .then(() => t.strictSame(fs.readdirSync(nm), ['rimraf'])))
+      .then(() => t.strictSame(fs.readdirSync(nm), ['rimraf']))
+  })
 
-  t.test('add semver', t =>
-    reify(lib, { add: ['semver@6.3.0'], global: true })
+  await t.test('add semver', async t => {
+    createRegistry(t, true)
+    await reify(lib, { add: ['semver@6.3.0'], global: true })
       .then(() => fs.statSync(rimrafBin))
       .then(() => fs.statSync(semverBin))
-      .then(() => t.strictSame(fs.readdirSync(nm).sort(), ['rimraf', 'semver'])))
+      .then(() => t.strictSame(fs.readdirSync(nm).sort(), ['rimraf', 'semver']))
+  })
 
-  t.test('remove semver', t =>
-    reify(lib, { rm: ['semver'], global: true })
+  await t.test('remove semver', async t => {
+    createRegistry(t, false)
+    await reify(lib, { rm: ['semver'], global: true })
       .then(() => fs.statSync(rimrafBin))
       .then(() => t.throws(() => fs.statSync(semverBin)))
-      .then(() => t.strictSame(fs.readdirSync(nm), ['rimraf'])))
+      .then(() => t.strictSame(fs.readdirSync(nm), ['rimraf']))
+  })
 
-  t.test('remove rimraf', t =>
-    reify(lib, { rm: ['rimraf'], global: true })
+  await t.test('remove rimraf', async t => {
+    createRegistry(t, false)
+    await reify(lib, { rm: ['rimraf'], global: true })
       .then(() => t.throws(() => fs.statSync(rimrafBin)))
       .then(() => t.throws(() => fs.statSync(semverBin)))
-      .then(() => t.strictSame(fs.readdirSync(nm), [])))
+      .then(() => t.strictSame(fs.readdirSync(nm), []))
+  })
 
-  t.test('add without bin links', t =>
-    reify(lib, { add: ['rimraf@2'], global: true, binLinks: false })
+  await t.test('add without bin links', async t => {
+    createRegistry(t, true)
+    await reify(lib, { add: ['rimraf@2'], global: true, binLinks: false })
       .then(() => t.throws(() => fs.statSync(rimrafBin)))
       .then(() => t.throws(() => fs.statSync(semverBin)))
-      .then(() => t.strictSame(fs.readdirSync(nm), ['rimraf'])))
-
-  t.end()
+      .then(() => t.strictSame(fs.readdirSync(nm), ['rimraf']))
+  })
 })
 
-t.test('workspaces', t => {
-  t.test('reify simple-workspaces', t =>
-    t.resolveMatchSnapshot(printReified(fixture(t, 'workspaces-simple')), 'should reify simple workspaces'))
+t.test('workspaces', async t => {
+  await t.test('reify simple-workspaces', async t => {
+    createRegistry(t, false)
+    await t.resolveMatchSnapshot(printReified(fixture(t, 'workspaces-simple')), 'should reify simple workspaces')
+  })
 
-  t.test('reify workspaces lockfile', async t => {
+  await t.test('reify workspaces omit dev dependencies', async t => {
+    const runCase = async (t, opts) => {
+      const path = fixture(t, 'workspaces-conflicting-dev-deps')
+      const rootAjv = resolve(path, 'node_modules/ajv/package.json')
+      const ajvOfPkgA = resolve(path, 'a/node_modules/ajv/package.json')
+      const ajvOfPkgB = resolve(path, 'b/node_modules/ajv/package.json')
+
+      t.equal(fs.existsSync(rootAjv), true, 'root ajv exists')
+      t.equal(fs.existsSync(ajvOfPkgA), true, 'ajv under package a node_modules exists')
+      t.equal(fs.existsSync(ajvOfPkgB), true, 'ajv under package a node_modules exists')
+
+      await reify(path, { omit: ['dev'], ...opts })
+
+      return {
+        root: { exists: () => fs.existsSync(rootAjv) },
+        a: { exists: () => fs.existsSync(ajvOfPkgA) },
+        b: { exists: () => fs.existsSync(ajvOfPkgB) },
+      }
+    }
+
+    await t.test('default', async t => {
+      createRegistry(t, false)
+      const { root, a, b } = await runCase(t)
+      t.equal(root.exists(), false, 'root')
+      t.equal(a.exists(), false, 'a')
+      t.equal(b.exists(), false, 'b')
+    })
+
+    await t.test('workspaces only', async t => {
+      createRegistry(t, false)
+      const { root, a, b } = await runCase(t, { workspaces: ['a'] })
+      t.equal(root.exists(), false, 'root')
+      t.equal(a.exists(), false, 'a')
+      t.equal(b.exists(), true, 'b')
+    })
+
+    await t.test('workspaces + root', async t => {
+      createRegistry(t, false)
+      const { root, a, b } = await runCase(t, { workspaces: ['a'], includeWorkspaceRoot: true })
+      t.equal(root.exists(), false, 'root')
+      t.equal(a.exists(), false, 'a')
+      t.equal(b.exists(), true, 'b')
+    })
+
+    await t.test('disable workspaces', async t => {
+      createRegistry(t, false)
+      const { root, a, b } = await runCase(t, { workspacesEnabled: false })
+      t.equal(root.exists(), false, 'root')
+      t.equal(a.exists(), true, 'a')
+      t.equal(b.exists(), true, 'b')
+    })
+  })
+
+  await t.test('reify workspaces lockfile', async t => {
     const path = fixture(t, 'workspaces-simple')
+    createRegistry(t, false)
     await reify(path)
     t.matchSnapshot(require(path + '/package-lock.json'), 'should lock workspaces config')
   })
 
-  t.test('reify workspaces bin files', t => {
+  await t.test('reify workspaces with overrides', async t => {
+    const path = fixture(t, 'workspaces-with-overrides')
+    createRegistry(t, true)
+    await reify(path, { workspacesEnabled: true, workspaces: ['ws'] })
+    t.matchSnapshot(require(path + '/package-lock.json'), 'should retain override version (4.1.3)')
+  })
+
+  await t.test('reify workspaces bin files', t => {
     const path = fixture(t, 'workspaces-link-bin')
+    createRegistry(t, false)
 
     const bins = [
       resolve(path, 'node_modules/.bin/a'),
@@ -1215,29 +1388,32 @@ t.test('workspaces', t => {
       .then(checkBin)
   })
 
-  t.test('reify from an actual loaded workspace env', t =>
-    t.resolveMatchSnapshot(
+  await t.test('reify from an actual loaded workspace env', async t => {
+    createRegistry(t, false)
+    await t.resolveMatchSnapshot(
       printReified(fixture(t, 'workspaces-non-simplistic')),
       'should not clean up entire nm folder for no reason'
-    ))
+    )
+  })
 
-  t.test('add new workspaces dep', async t => {
+  await t.test('add new workspaces dep', async t => {
+    createRegistry(t, true)
     const path = fixture(t, 'workspaces-add-new-dep')
     await reify(path)
     t.matchSnapshot(require(path + '/package-lock.json'), 'should update package-lock with new added dep')
   })
 
-  t.test('root as-a-workspace', async t => {
+  await t.test('root as-a-workspace', async t => {
+    createRegistry(t, true)
     const path = fixture(t, 'workspaces-root-linked')
     await reify(path)
     t.matchSnapshot(require(path + '/package-lock.json'), 'should produce expected package-lock file')
   })
-
-  t.end()
 })
 
 t.test('reify from old package-lock with bins', async t => {
   const path = fixture(t, 'old-package-lock-with-bins')
+  createRegistry(t, true)
   await reify(path, {})
 
   t.matchSnapshot(
@@ -1262,6 +1438,7 @@ t.test('fail early if bins will conflict', async t => {
       semver: 'this is not the linked bin',
     },
   })
+  createRegistry(t, true)
   const arb = newArb({
     global: true,
     path: `${path}/lib`,
@@ -1275,6 +1452,7 @@ t.test('fail early if bins will conflict', async t => {
 t.test('add a dep present in the tree, with v1 shrinkwrap', async t => {
   // https://github.com/npm/arborist/issues/70
   const path = fixture(t, 'old-package-lock')
+  createRegistry(t, true)
   await reify(path, { add: ['wrappy'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
 })
@@ -1288,6 +1466,7 @@ t.test('store files with a custom indenting', async t => {
   const path = t.testdir({
     'package.json': tabIndentedPackageJson,
   })
+  createRegistry(t, true)
   await reify(path)
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
   t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'))
@@ -1295,6 +1474,7 @@ t.test('store files with a custom indenting', async t => {
 
 t.test('do not rewrite valid package.json shorthands', async t => {
   const path = fixture(t, 'package-json-shorthands')
+  createRegistry(t, false)
   await reify(path)
   const res = require(path + '/package.json')
   t.equal(res.bin, './index.js', 'should not rewrite bin property')
@@ -1303,28 +1483,33 @@ t.test('do not rewrite valid package.json shorthands', async t => {
 
 t.test('modules bundled by the root should be installed', async t => {
   const path = fixture(t, 'root-bundler')
+  createRegistry(t, false)
   await reify(path)
   t.matchSnapshot(fs.readFileSync(path + '/node_modules/child/package.json', 'utf8'))
 })
 
 t.test('add a new pkg to a prefix that needs to be mkdirpd', async t => {
-  const path = resolve(t.testdir(), 'missing/path/to/root')
-  const tree = await reify(path, { add: ['abbrev'] })
-  t.matchSnapshot(
-    printTree(tree),
-    'should output a successful tree in mkdirp folder'
-  )
-  t.matchSnapshot(
-    fs.readFileSync(path + '/package.json', 'utf8'),
-    'should place expected package.json file into place'
-  )
-  t.matchSnapshot(
-    fs.readFileSync(path + '/package-lock.json', 'utf8'),
-    'should place expected lockfile file into place'
-  )
-
-  t.test('dry run scenarios', async t => {
+  await t.test('not dry run', async t => {
     const path = resolve(t.testdir(), 'missing/path/to/root')
+    createRegistry(t, true)
+    const tree = await reify(path, { add: ['abbrev'] })
+    t.matchSnapshot(
+      printTree(tree),
+      'should output a successful tree in mkdirp folder'
+    )
+    t.matchSnapshot(
+      fs.readFileSync(path + '/package.json', 'utf8'),
+      'should place expected package.json file into place'
+    )
+    t.matchSnapshot(
+      fs.readFileSync(path + '/package-lock.json', 'utf8'),
+      'should place expected lockfile file into place'
+    )
+  })
+
+  await t.test('dry run scenarios', async t => {
+    const path = resolve(t.testdir(), 'missing/path/to/root')
+    createRegistry(t, false)
 
     try {
       await reify(path, { add: ['abbrev'], dryRun: true })
@@ -1342,6 +1527,7 @@ t.test('add a new pkg to a prefix that needs to be mkdirpd', async t => {
 
 t.test('do not delete root-bundled deps in global update', async t => {
   const path = t.testdir()
+  createRegistry(t, false)
   const file = resolve(__dirname, '../fixtures/bundle.tgz')
   await reify(path, { global: true, add: [`file:${file}`] })
   const depPJ = resolve(path, 'node_modules/bundle/node_modules/dep/package.json')
@@ -1352,6 +1538,7 @@ t.test('do not delete root-bundled deps in global update', async t => {
 
 t.test('do not excessively duplicate bundled metadeps', async t => {
   const path = fixture(t, 'bundle-metadep-duplication')
+  createRegistry(t, true)
   const tree = await reify(path)
   const hidden = path + '/node_modules/.package-lock.json'
   t.matchSnapshot(fs.readFileSync(hidden, 'utf8'), 'hidden lockfile')
@@ -1362,12 +1549,14 @@ t.test('do not excessively duplicate bundled metadeps', async t => {
 
 t.test('do not reify root when root matches duplicated metadep', async t => {
   const path = fixture(t, 'test-root-matches-metadep')
+  createRegistry(t, true)
   await reify(path)
   fs.statSync(path + '/do-not-delete-this-file')
 })
 
 t.test('reify properly with all deps when lockfile is ancient', async t => {
   const path = fixture(t, 'sax')
+  createRegistry(t, true)
   const tree = await reify(path)
   t.matchSnapshot(printTree(tree))
   fs.statSync(path + '/node_modules/tap/node_modules/.bin/nyc')
@@ -1379,6 +1568,7 @@ t.test('add multiple pkgs in a specific order', async t => {
       name: 'multiple-pkgs',
     }),
   })
+  createRegistry(t, true)
   await reify(path, { add: ['wrappy', 'abbrev'] })
   t.matchSnapshot(
     fs.readFileSync(path + '/package.json', 'utf8'),
@@ -1398,6 +1588,7 @@ t.test('save complete lockfile on update-all', async t => {
       version: '1.0.0',
     }),
   })
+  createRegistry(t, true)
   // install the older version first
   const lock = () => fs.readFileSync(`${path}/package-lock.json`, 'utf8')
   await reify(path, { add: ['abbrev@1.0.4'] })
@@ -1406,25 +1597,23 @@ t.test('save complete lockfile on update-all', async t => {
   t.matchSnapshot(lock(), 'should update, but not drop root metadata')
 })
 
-t.test('save proper lockfile with bins when upgrading lockfile', t => {
-  const completeOpts = [true, false]
-  completeOpts.forEach(complete => {
-    t.test(`complete=${complete}`, async t => {
+t.test('save proper lockfile with bins when upgrading lockfile', async t => {
+  for (const complete of [true, false]) {
+    await t.test(`complete=${complete}`, async t => {
       const path = fixture(t, 'semver-installed-with-old-package-lock')
+      createRegistry(t, true)
       const lock = () => fs.readFileSync(`${path}/package-lock.json`, 'utf8')
       await reify(path, { complete })
       t.matchSnapshot(lock(), 'should upgrade, with bins in place')
     })
-  })
-
-  t.end()
+  }
 })
 
 t.test('rollback if process is terminated during reify process', async t => {
   const onExit = require('../../lib/signal-handling.js')
   // mock the process so we don't have to kill this test
   // copy-pasta from signal-handling test
-  const EE = require('events')
+  const EE = require('node:events')
   const proc = onExit.process = new class MockProcess extends EE {
     constructor () {
       super()
@@ -1479,6 +1668,7 @@ t.test('rollback if process is terminated during reify process', async t => {
       })
 
       t.test('clean install', async t => {
+        createRegistry(t, true)
         const arb = newArb({ path })
         // starting from an empty folder, ends up empty
         await t.rejects(arb.reify(), {
@@ -1502,6 +1692,7 @@ t.test('rollback if process is terminated during reify process', async t => {
           name: 'abbrev',
           version: '0.0.0',
         }))
+        createRegistry(t, true)
         const arb = newArb({ path })
         await t.rejects(arb.reify({ add: ['abbrev@1.1.1'] }), {
           message: 'process terminated',
@@ -1552,8 +1743,9 @@ t.test('warn and correct if damaged data in lockfile', async t => {
     }),
   })
 
-  t.test('first pass logs', async t => {
+  await t.test('first pass logs', async t => {
     const getLogs = warningTracker()
+    createRegistry(t, false)
     await reify(path)
     t.strictSame(getLogs(), [
       [
@@ -1568,8 +1760,9 @@ t.test('warn and correct if damaged data in lockfile', async t => {
     t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'), '"fixed" lockfile')
   })
 
-  t.test('second pass just does the right thing', async t => {
+  await t.test('second pass just does the right thing', async t => {
     const getLogs = warningTracker()
+    createRegistry(t, true)
     await reify(path)
     t.strictSame(getLogs(), [], 'no warnings this time')
     t.matchSnapshot(fs.readFileSync(path + '/package-lock.json', 'utf8'), 'actually fixed lockfile')
@@ -1578,6 +1771,7 @@ t.test('warn and correct if damaged data in lockfile', async t => {
 
 t.test('properly update one module when multiple are present', async t => {
   const path = t.testdir({})
+  createRegistry(t, true)
   const abbrevpj = resolve(path, 'node_modules/abbrev/package.json')
   const oncepj = resolve(path, 'node_modules/once/package.json')
 
@@ -1607,6 +1801,7 @@ t.test('saving should not replace file: dep with version', async t => {
     },
     'package.json': JSON.stringify({}),
   })
+  createRegistry(t, false)
   process.chdir(path)
 
   const pj = resolve(path, 'package.json')
@@ -1680,6 +1875,7 @@ t.test('filtered reification in workspaces', async t => {
       },
     },
   })
+  createRegistry(t, true)
 
   const hiddenLock = resolve(path, 'node_modules/.package-lock.json')
 
@@ -1776,6 +1972,7 @@ console.log('1..1')
 console.log('ok 1 - this is fine')
 `,
   })
+  createRegistry(t, true)
 
   t.matchSnapshot(await printReified(path), 'result')
   t.resolves(runScript({
@@ -1788,6 +1985,7 @@ console.log('ok 1 - this is fine')
 
 t.test('running lifecycle scripts of unchanged link nodes on reify', async t => {
   const path = fixture(t, 'link-dep-lifecycle-scripts')
+  createRegistry(t, false)
   t.matchSnapshot(await printReified(path), 'result')
 
   t.ok(fs.lstatSync(resolve(path, 'a/a-prepare')).isFile(),
@@ -1803,6 +2001,7 @@ t.test('save-prod, with optional', async t => {
       optionalDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'], saveType: 'prod' })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1814,6 +2013,7 @@ t.test('saveBundle', async t => {
       dependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'], saveType: 'prod', saveBundle: true })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1826,6 +2026,7 @@ t.test('no saveType: dev w/ compatible peer', async t => {
       devDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1838,6 +2039,7 @@ t.test('no saveType: dev w/ incompatible peer', async t => {
       devDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1850,6 +2052,7 @@ t.test('no saveType: dev w/ compatible optional', async t => {
       devDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1862,6 +2065,7 @@ t.test('no saveType: dev w/ incompatible optional', async t => {
       devDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1874,6 +2078,7 @@ t.test('no saveType: prod w/ peer', async t => {
       dependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1885,6 +2090,7 @@ t.test('no saveType: peer only', async t => {
       peerDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1896,6 +2102,7 @@ t.test('no saveType: optional only', async t => {
       optionalDependencies: { abbrev: '*' },
     }),
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['abbrev'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1943,6 +2150,7 @@ t.test('do not delete linked targets when link omitted', async t => {
   const fooindex = resolve(path, 'foo/index.js')
   t.equal(fs.existsSync(barpj), true, 'bar package.json present')
   t.equal(fs.existsSync(fooindex), true, 'foo index.js present')
+  createRegistry(t, false)
   const tree = await reify(path, { omit: ['dev'] })
   t.equal(fs.existsSync(barpj), true, 'bar package.json still present')
   t.equal(fs.existsSync(fooindex), true, 'foo index.js still present')
@@ -1952,6 +2160,7 @@ t.test('do not delete linked targets when link omitted', async t => {
 
 t.test('add spec * with semver prefix range gets updated', async t => {
   const path = t.testdir({ 'package.json': '{}' })
+  createRegistry(t, true)
   const arb = newArb({ path })
   await arb.reify({ add: ['latest-is-prerelease'] })
   t.matchSnapshot(fs.readFileSync(path + '/package.json', 'utf8'))
@@ -1988,6 +2197,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('no args', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     const tree = await reify(path)
     t.equal(tree.children.get('mkdirp').version, '1.0.4')
     t.equal(tree.children.get('a').target.children.get('mkdirp').version, '0.5.5')
@@ -1998,6 +2208,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('add mkdirp 0.5.0 to b', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     await reify(path)
     const tree = await reify(path, { workspaces: ['b'], add: ['mkdirp@0.5.0'] })
     t.equal(tree.children.get('mkdirp').version, '1.0.4')
@@ -2010,6 +2221,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('remove mkdirp from a', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     await reify(path)
     const tree = await reify(path, { workspaces: ['a'], rm: ['mkdirp'] })
     t.equal(tree.children.get('mkdirp').version, '1.0.4')
@@ -2023,6 +2235,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('upgrade mkdirp in a, dedupe on root', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     await reify(path)
     const tree = await reify(path, { workspaces: ['a'], add: ['mkdirp@1'] })
     t.equal(tree.children.get('mkdirp').version, '1.0.4')
@@ -2036,6 +2249,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('add mkdirp 0.5.0 to b, empty start', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     const tree = await reify(path, { workspaces: ['b'], add: ['mkdirp@0.5.0'] })
     t.equal(tree.children.get('mkdirp'), undefined)
     t.equal(tree.children.get('a'), undefined, 'did not even link workspace "a"')
@@ -2047,6 +2261,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('remove mkdirp from a, empty start', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     const tree = await reify(path, { workspaces: ['a'], rm: ['mkdirp'] })
     t.equal(tree.children.get('mkdirp'), undefined)
     t.equal(tree.children.get('a').target.children.get('mkdirp'), undefined)
@@ -2059,6 +2274,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('upgrade mkdirp in a, dedupe on root, empty start', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     const tree = await reify(path, { workspaces: ['a'], add: ['mkdirp@1'] })
     t.equal(tree.children.get('mkdirp').version, '1.0.4')
     t.equal(tree.children.get('a').target.children.get('mkdirp'), undefined)
@@ -2071,6 +2287,7 @@ t.test('add deps to workspaces', async t => {
 
   t.test('add a to root', async t => {
     const path = t.testdir(fixture)
+    createRegistry(t, true)
     await reify(path)
     const tree = await reify(path, { add: ['a'], lockfileVersion: 3 })
     t.matchSnapshot(printTree(tree), 'returned tree')
@@ -2080,8 +2297,6 @@ t.test('add deps to workspaces', async t => {
 })
 
 t.test('reify audit only workspace deps when reifying workspace', async t => {
-  const auditFile = resolve(__dirname, '../fixtures/audit-nyc-mkdirp/advisory-bulk.json')
-  t.teardown(advisoryBulkResponse(auditFile))
   const path = t.testdir({
     'package.json': JSON.stringify({
       workspaces: ['packages/*'],
@@ -2107,6 +2322,8 @@ t.test('reify audit only workspace deps when reifying workspace', async t => {
       },
     },
   })
+  const registry = createRegistry(t, true)
+  registry.audit({ results: require('../fixtures/audit-nyc-mkdirp/advisory-bulk.json') })
   const arb = newArb({ path, audit: true, workspaces: ['a'] })
   const tree = await arb.reify()
   const report = arb.auditReport.toJSON()
@@ -2178,6 +2395,7 @@ t.test('update a dep when the lockfile is lying about it', async t => {
     },
   })
 
+  createRegistry(t, true)
   const tree = await reify(path)
   const abbrev = tree.children.get('abbrev')
   t.equal(abbrev.version, '1.1.1')
@@ -2189,6 +2407,7 @@ t.test('shrinkwrap which lacks metadata updates deps', async t => {
     'package.json': '{}',
   })
 
+  createRegistry(t, true)
   const first = await reify(path, {
     add: ['@isaacs/testing-shrinkwrap-abbrev@1.2.0'],
   })
@@ -2247,6 +2466,7 @@ t.test('move aside symlink clutter', async t => {
     return this[kReifyPackages]()
   }
 
+  createRegistry(t, true)
   const tree = await printReified(path)
   const st = fs.lstatSync(path + '/node_modules/abbrev')
   t.equal(st.isSymbolicLink(), false)
@@ -2286,6 +2506,7 @@ t.test('collide case-variant dep names', async t => {
     },
   })
 
+  createRegistry(t, true)
   const tree = await printReified(path)
   const st = fs.lstatSync(path + '/node_modules/abbrev')
   t.equal(st.isSymbolicLink(), false)
@@ -2326,6 +2547,7 @@ t.test('node_modules may not be a symlink', async t => {
       },
     }),
   })
+  createRegistry(t, true)
   const warnings = warningTracker()
   const tree = await printReified(path)
   t.matchSnapshot(tree)
@@ -2350,6 +2572,7 @@ t.test('never unpack into anything other than a real directory', async t => {
       }),
     },
   })
+  createRegistry(t, true)
   const arb = newArb({ path })
   const logs = debugLogTracker()
   const wrappy = resolve(path, 'node_modules/once/node_modules/wrappy')
@@ -2377,8 +2600,33 @@ t.test('adding an unresolvable optional dep is OK', async t => {
       },
     }),
   })
+  createRegistry(t, true)
   const tree = await reify(path, { add: ['abbrev'] })
-  t.strictSame([...tree.children.values()], [], 'nothing actually added')
+  const children = [...tree.children.values()]
+  t.equal(children.length, 1, 'optional unresolved dep node added')
+  t.ok(children[0].ideallyInert, 'node is ideally inert')
+  t.throws(() => fs.statSync(path + '/node_modules/abbrev'), { code: 'ENOENT' }, 'optional dependency should not exist on disk')
+  t.matchSnapshot(printTree(tree))
+})
+
+t.test('adding an unresolvable optional dep is OK - maintains inertness', async t => {
+  const path = t.testdir({
+    'package.json': JSON.stringify({
+      dependencies: {
+        wrappy: '1.0.2',
+      },
+      optionalDependencies: {
+        abbrev: '999999',
+      },
+    }),
+  })
+  createRegistry(t, true)
+  let tree = await reify(path, { add: ['abbrev'] })
+  const children = [...tree.children.values()]
+  t.equal(children.length, 2, 'optional unresolved dep node added')
+  t.ok(children[0].ideallyInert, 'node is ideally inert')
+  t.throws(() => fs.statSync(path + '/node_modules/abbrev'), { code: 'ENOENT' }, 'optional dependency should not exist on disk')
+  tree = await reify(path, { add: ['abbrev'] })
   t.matchSnapshot(printTree(tree))
 })
 
@@ -2411,6 +2659,7 @@ t.test('includeWorkspaceRoot in addition to workspace', async t => {
       },
     },
   })
+  createRegistry(t, true)
   const tree = await reify(path, { includeWorkspaceRoot: true, workspaces: ['a'] })
   t.matchSnapshot(printTree(tree))
   t.equal(tree.inventory.query('name', 'semver').size, 0)
@@ -2447,6 +2696,7 @@ t.test('no workspace', async t => {
       },
     },
   })
+  createRegistry(t, true)
   const tree = await reify(path, { workspacesEnabled: false, workspaces: ['a', 'b'] })
   t.matchSnapshot(printTree(tree))
   t.equal(tree.inventory.query('name', 'semver').size, 0)
@@ -2482,6 +2732,7 @@ t.test('add local dep with existing dev + peer/optional', async t => {
   t.teardown(() => process.chdir(cwd))
   process.chdir(project)
 
+  createRegistry(t, false)
   const tree = await reify(project, { add: ['../dep'] })
 
   t.matchSnapshot(printTree(tree), 'tree')
@@ -2505,6 +2756,7 @@ t.test('runs dependencies script if tree changes', async (t) => {
     }),
   })
 
+  createRegistry(t, true)
   await reify(path)
 
   for (const script of ['predependencies', 'dependencies', 'postdependencies']) {
@@ -2523,19 +2775,12 @@ t.test('runs dependencies script if tree changes', async (t) => {
     t.not(fs.existsSync(expectedPath), `did not run ${script}`)
   }
 
-  // take over console.log as run-script is going to print a banner for these because
-  // they're running in the foreground
-  const _log = console.log
-  t.teardown(() => {
-    console.log = _log
-  })
-  const logs = []
-  console.log = (msg) => logs.push(msg)
+  const outputs = outputTracker()
+
   // reify again, this time adding a new dependency
   await reify(path, { foregroundScripts: true, add: ['once@^1.4.0'] })
-  console.log = _log
 
-  t.match(logs, [/predependencies/, /dependencies/, /postdependencies/], 'logged banners')
+  t.match(outputs(), [/predependencies/, /dependencies/, /postdependencies/], 'logged banners')
 
   // files should exist again
   for (const script of ['predependencies', 'dependencies', 'postdependencies']) {
@@ -2549,6 +2794,7 @@ t.test('save package.json on update', t => {
   t.test('should save many deps in multiple package.json when using save=true', async t => {
     const path = fixture(t, 'workspaces-need-update')
 
+    createRegistry(t, true)
     await reify(path, { update: true, save: true })
 
     t.same(
@@ -2570,6 +2816,7 @@ t.test('save package.json on update', t => {
   t.test('should not save many deps in multiple package.json when using save=false', async t => {
     const path = fixture(t, 'workspaces-need-update')
 
+    createRegistry(t, true)
     await reify(path, { update: true, save: false })
 
     t.same(
@@ -2595,6 +2842,7 @@ t.test('save package.json on update', t => {
   t.test('should not save any with save=false and package-lock=false', async t => {
     const path = fixture(t, 'workspaces-need-update')
 
+    createRegistry(t, true)
     await reify(path, { update: true, save: false, packageLock: false })
 
     t.same(
@@ -2620,6 +2868,7 @@ t.test('save package.json on update', t => {
   t.test('should update named dep across multiple package.json using save=true', async t => {
     const path = fixture(t, 'workspaces-need-update')
 
+    createRegistry(t, true)
     await reify(path, { update: ['abbrev'], save: true })
 
     t.same(
@@ -2648,6 +2897,7 @@ t.test('save package.json on update', t => {
   t.test('should update single named dep across multiple package.json using save=true', async t => {
     const path = fixture(t, 'workspaces-need-update')
 
+    createRegistry(t, true)
     await reify(path, { update: ['once'], save: true })
 
     t.same(
@@ -2676,6 +2926,7 @@ t.test('save package.json on update', t => {
   t.test('should preserve exact ranges', async t => {
     const path = fixture(t, 'update-exact-version')
 
+    createRegistry(t, true)
     await reify(path, { update: true, save: true })
 
     t.equal(
@@ -2694,6 +2945,7 @@ t.test('save package.json on update', t => {
       }),
     })
 
+    createRegistry(t, true)
     await reify(path, { update: true, save: true })
 
     t.equal(
@@ -2722,6 +2974,7 @@ t.test('save package.json on update', t => {
       },
     })
 
+    createRegistry(t, false)
     await t.resolves(reify(resolve(path, 'one'), { update: true, save: true, workspaces: [] }))
 
     t.equal(
@@ -2757,6 +3010,7 @@ t.test('installLinks', (t) => {
       },
     })
 
+    createRegistry(t, false)
     await reify(resolve(path, 'a'), { installLinks: true })
 
     const installedB = fs.lstatSync(resolve(path, 'a/node_modules/b'))
@@ -2786,6 +3040,7 @@ t.test('installLinks', (t) => {
       },
     })
 
+    createRegistry(t, false)
     await reify(resolve(path, 'a'), { installLinks: false })
 
     const installedB = fs.lstatSync(resolve(path, 'a/node_modules/b'))
@@ -2815,6 +3070,7 @@ t.test('installLinks', (t) => {
       },
     })
 
+    createRegistry(t, false)
     await reify(resolve(path, 'a'), { installLinks: false, save: true })
 
     const firstB = fs.lstatSync(resolve(path, 'a/node_modules/b'))
@@ -2849,6 +3105,7 @@ t.test('installLinks', (t) => {
       },
     })
 
+    createRegistry(t, false)
     await reify(resolve(path, 'a'), { installLinks: true })
 
     const firstB = fs.lstatSync(resolve(path, 'a/node_modules/b'))
@@ -2886,6 +3143,7 @@ t.test('installLinks', (t) => {
       },
     })
 
+    createRegistry(t, true)
     await reify(resolve(path, 'a'), { installLinks: true })
 
     const installedB = fs.lstatSync(resolve(path, 'a/node_modules/b'))
@@ -2931,6 +3189,7 @@ t.test('installLinks', (t) => {
       },
     })
 
+    createRegistry(t, true)
     await reify(resolve(path, 'a'), { installLinks: true })
 
     const installedB = fs.lstatSync(resolve(path, 'a/node_modules/b'))
@@ -2946,7 +3205,76 @@ t.test('installLinks', (t) => {
   t.end()
 })
 
-t.only('should preserve exact ranges, missing actual tree', async (t) => {
+t.test('root overrides with file: paths are visible to workspaces', async t => {
+  const path = t.testdir({
+    'package.json': JSON.stringify({
+      name: 'root',
+      workspaces: ['hello', 'nested/goodbye'],
+      dependencies: {},
+      overrides: {
+        print: 'file:./print',
+      },
+    }),
+    hello: {
+      'package.json': JSON.stringify({
+        name: 'hello',
+        version: '1.0.0',
+        dependencies: {
+          print: '../print',
+        },
+      }),
+    },
+    nested: {
+      goodbye: {
+        'package.json': JSON.stringify({
+          name: 'second',
+          version: '1.0.0',
+          dependencies: {
+            print: '../print',
+          },
+        }),
+      },
+    },
+    print: {
+      'package.json': JSON.stringify({
+        name: 'print',
+        version: '1.0.0',
+        main: 'index.js',
+      }),
+    },
+  })
+
+  createRegistry(t, false)
+  await reify(path)
+
+  const printSymlink = fs.readlinkSync(resolve(path, 'node_modules/print'))
+  const secondSymlink = fs.readlinkSync(resolve(path, 'node_modules/second'))
+
+  // Create a platform-agnostic way to compare symlink targets
+  const normalizeLinkTarget = target => {
+    if (process.platform === 'win32') {
+      // For Windows: convert absolute paths to relative and normalize slashes
+      const linkDir = dirname(resolve(path, 'node_modules/print'))
+      return relative(linkDir, target).replace(/\\/g, '/')
+    }
+    // For Unix: already a relative path
+    return target
+  }
+
+  t.equal(
+    normalizeLinkTarget(printSymlink),
+    '../print',
+    'print symlink points to ../print (normalized for platform)'
+  )
+
+  t.equal(
+    normalizeLinkTarget(secondSymlink),
+    '../nested/goodbye',
+    'print symlink points to ../nested/goodbye (normalized for platform)'
+  )
+})
+
+t.test('should preserve exact ranges, missing actual tree', async (t) => {
   const Pacote = require('pacote')
   const Arborist = t.mock('../../lib/arborist', {
     pacote: {
@@ -3015,6 +3343,24 @@ t.only('should preserve exact ranges, missing actual tree', async (t) => {
     },
   })
 
+  const customGitSshPackument = JSON.stringify({
+    _id: 'gitssh',
+    _rev: 'lkjadflkjasdf',
+    name: 'gitssh',
+    'dist-tags': { latest: '1.1.1' },
+    versions: {
+      '1.1.1': {
+        name: 'gitssh',
+        version: '1.1.1',
+        dist: {
+          // this is a url that `new URL()` cant parse
+          // https://github.com/npm/cli/issues/5278
+          tarball: 'git+ssh://git@customgit.com:a/b/c.git#lkjadflkjasdf',
+        },
+      },
+    },
+  })
+
   const notAUrlPackument = JSON.stringify({
     _id: 'notaurl',
     _rev: 'lkjadflkjasdf',
@@ -3031,7 +3377,37 @@ t.only('should preserve exact ranges, missing actual tree', async (t) => {
     },
   })
 
-  t.only('host should not be replaced replaceRegistryHost=never', async (t) => {
+  t.test('valid custom hosted git url', async (t) => {
+    const testdir = t.testdir({
+      project: {
+        'package.json': JSON.stringify({
+          name: 'myproject',
+          version: '1.0.0',
+          dependencies: {
+            gitssh: '1.1.1',
+          },
+        }),
+      },
+    })
+
+    tnock(t, 'https://registry.github.com')
+      .get('/gitssh')
+      .reply(200, customGitSshPackument)
+
+    const getLogs = warningTracker()
+
+    const arb = new Arborist({
+      path: resolve(testdir, 'project'),
+      registry: 'https://registry.github.com',
+      cache: resolve(testdir, 'cache'),
+    })
+    await arb.reify()
+    // since it's not throwing an error on invalid url and returning undefined
+    // which trashes the node, so here we can only check if it has no warnings
+    t.strictSame(getLogs(), [], 'did not get warnings')
+  })
+
+  t.test('host should not be replaced replaceRegistryHost=never', async (t) => {
     const testdir = t.testdir({
       project: {
         'package.json': JSON.stringify({
@@ -3071,7 +3447,7 @@ t.only('should preserve exact ranges, missing actual tree', async (t) => {
     await arb.reify()
   })
 
-  t.only('host should be replaced replaceRegistryHost=npmjs', async (t) => {
+  t.test('host should be replaced replaceRegistryHost=npmjs', async (t) => {
     const testdir = t.testdir({
       project: {
         'package.json': JSON.stringify({
@@ -3111,7 +3487,7 @@ t.only('should preserve exact ranges, missing actual tree', async (t) => {
     await arb.reify()
   })
 
-  t.only('host should be always replaceRegistryHost=always', async (t) => {
+  t.test('host should be always replaceRegistryHost=always', async (t) => {
     const testdir = t.testdir({
       project: {
         'package.json': JSON.stringify({
@@ -3149,6 +3525,107 @@ t.only('should preserve exact ranges, missing actual tree', async (t) => {
       replaceRegistryHost: 'always',
     })
     await arb.reify()
+  })
+
+  t.test('registry with path should only swap hostname', async (t) => {
+    const abbrevPackument3 = JSON.stringify({
+      _id: 'abbrev',
+      _rev: 'lkjadflkjasdf',
+      name: 'abbrev',
+      'dist-tags': { latest: '1.1.1' },
+      versions: {
+        '1.1.1': {
+          name: 'abbrev',
+          version: '1.1.1',
+          dist: {
+            tarball: 'https://artifactory.example.com/api/npm/npm-all/abbrev/-/abbrev-1.1.1.tgz',
+          },
+        },
+      },
+    })
+
+    const testdir = t.testdir({
+      project: {
+        'package.json': JSON.stringify({
+          name: 'myproject',
+          version: '1.0.0',
+          dependencies: {
+            abbrev: '1.1.1',
+          },
+        }),
+      },
+    })
+
+    tnock(t, 'https://new-host.artifactory.example.com')
+      .get('/api/npm/npm-all/abbrev')
+      .reply(200, abbrevPackument3)
+
+    tnock(t, 'https://new-host.artifactory.example.com')
+      .get('/api/npm/npm-all/abbrev/-/abbrev-1.1.1.tgz')
+      .reply(200, abbrevTGZ)
+
+    const arb = new Arborist({
+      path: resolve(testdir, 'project'),
+      registry: 'https://new-host.artifactory.example.com/api/npm/npm-all',
+      cache: resolve(testdir, 'cache'),
+      replaceRegistryHost: 'always',
+    })
+    await arb.reify()
+  })
+
+  t.test('registry path prepending', async t => {
+    // A registry path is prepended to resolved URLs that don't already have it
+    const abbrevPackument4 = JSON.stringify({
+      _id: 'abbrev',
+      _rev: 'lkjadflkjasdf',
+      name: 'abbrev',
+      'dist-tags': { latest: '1.1.1' },
+      versions: {
+        '1.1.1': {
+          name: 'abbrev',
+          version: '1.1.1',
+          dist: {
+            // Note: This URL has no path component that matches our registry path
+            tarball: 'https://external-registry.example.com/abbrev-1.1.1.tgz',
+          },
+        },
+      },
+    })
+
+    const testdir = t.testdir({
+      project: {
+        'package.json': JSON.stringify({
+          name: 'myproject',
+          version: '1.0.0',
+          dependencies: {
+            abbrev: '1.1.1',
+          },
+        }),
+      },
+    })
+
+    // Set up the registry with a deep path
+    const registryHost = 'https://registry.example.com'
+    const registryPath = '/custom/deep/path/registry'
+    const registry = `${registryHost}${registryPath}`
+
+    tnock(t, registryHost)
+      .get(`${registryPath}/abbrev`)
+      .reply(200, abbrevPackument4)
+
+    // This is the critical test - the tarball URL in the packument doesn't have our registry path, but when replaceRegistryHost is 'always', we should get a request to this URL which includes the registry path
+    tnock(t, registryHost)
+      .get(`${registryPath}/abbrev-1.1.1.tgz`)
+      .reply(200, abbrevTGZ)
+
+    const arb = new Arborist({
+      path: resolve(testdir, 'project'),
+      registry,
+      cache: resolve(testdir, 'cache'),
+      replaceRegistryHost: 'always',
+    })
+
+    await t.resolves(arb.reify(), 'reify should complete successfully')
   })
 })
 
@@ -3208,4 +3685,239 @@ t.test('install stategy linked', async (t) => {
     t.ok(store.isDirectory(), 'abbrev got installed')
     t.ok(abbrev.isSymbolicLink(), 'abbrev got installed')
   })
+})
+
+t.test('workspace installs retain existing versions with newer package specs', async t => {
+  const path = t.testdir({
+    'package.json': JSON.stringify({
+      workspaces: [
+        'packages/*',
+      ],
+      overrides: {
+        'doesnt-matter-can-be-anything': '1.2.3',
+      },
+    }),
+    packages: {
+      'my-cool-package': {
+        'package.json': JSON.stringify({}),
+      },
+      'another-cool-package': {
+        'package.json': JSON.stringify({}),
+      },
+    },
+  })
+
+  createRegistry(t, true)
+
+  // Step 1: Install abbrev@1.0.4 in my-cool-package
+  await reify(path, {
+    add: ['abbrev@1.0.4'],
+    // setting savePrefix to '' is exactly what the --save-exact flag does in definitions.js
+    savePrefix: '',
+    workspaces: ['my-cool-package'],
+  })
+
+  // Verify hoisted installation
+  const rootNodeModules = resolve(path, 'node_modules/abbrev/package.json')
+  t.ok(fs.existsSync(rootNodeModules), 'abbrev should be hoisted to root node_modules')
+
+  const hoistedPkg = JSON.parse(fs.readFileSync(rootNodeModules, 'utf8'))
+  t.equal(hoistedPkg.version, '1.0.4', 'hoisted version should be 1.0.4')
+
+  // Check my-cool-package package.json
+  const myPackageJson = JSON.parse(fs.readFileSync(
+    resolve(path, 'packages/my-cool-package/package.json'), 'utf8'))
+  t.same(myPackageJson.dependencies, { abbrev: '1.0.4' },
+    'my-cool-package should have abbrev@1.0.4 in dependencies')
+
+  // Step 2: Install abbrev@1.1.1 in another-cool-package
+  await reify(path, {
+    add: ['abbrev@1.1.1'],
+    savePrefix: '',
+    workspaces: ['another-cool-package'],
+  })
+
+  // Verify un-hoisted installation
+  const anotherNodeModules = resolve(path, 'packages/another-cool-package/node_modules/abbrev/package.json')
+  t.ok(fs.existsSync(anotherNodeModules), 'abbrev@1.1.1 should be installed in another-cool-package/node_modules')
+
+  const unhoistedPkg = JSON.parse(fs.readFileSync(anotherNodeModules, 'utf8'))
+  t.equal(unhoistedPkg.version, '1.1.1', 'unhoisted version should be 1.1.1')
+
+  // Check another-cool-package package.json
+  const anotherPackageJson = JSON.parse(fs.readFileSync(
+    resolve(path, 'packages/another-cool-package/package.json'), 'utf8'))
+  t.same(anotherPackageJson.dependencies, { abbrev: '1.1.1' },
+    'another-cool-package should have abbrev@1.1.1 in dependencies')
+
+  // Step 3: Install abbrev@1.0.4 in another-cool-package
+  await reify(path, {
+    add: ['abbrev@1.0.4'],
+    savePrefix: '',
+    workspaces: ['another-cool-package'],
+  })
+
+  t.ok(fs.existsSync(rootNodeModules), 'abbrev@1.0.4 should still be hoisted to root node_modules')
+  t.notOk(fs.existsSync(anotherNodeModules), 'abbrev@1.1.1 should be removed from another-cool-package/node_modules')
+
+  // Check another-cool-package package.json - should now be updated to 1.0.4
+  const updatedPackageJson = JSON.parse(fs.readFileSync(
+    resolve(path, 'packages/another-cool-package/package.json'), 'utf8'))
+  t.same(updatedPackageJson.dependencies, { abbrev: '1.0.4' },
+    'another-cool-package package.json should be updated to abbrev@1.0.4')
+})
+
+t.test('externalProxy returns early for ideally inert node with installStrategy linked', async t => {
+  const path = t.testdir({
+    'package.json': JSON.stringify({
+      dependencies: {
+        abbrev: '1.1.1',
+      },
+    }),
+    'package-lock.json': JSON.stringify({
+      lockfileVersion: 2,
+      requires: true,
+      packages: {
+        '': {
+          devDependencies: {
+            abbrev: '1.1.1',
+          },
+        },
+        'node_modules/abbrev': {
+          version: '1.1.1',
+          resolved: 'https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz',
+          integrity: 'sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==',
+          dev: true,
+          ideallyInert: true,
+        },
+      },
+      dependencies: {
+        abbrev: {
+          version: '1.1.1',
+          resolved: 'https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz',
+          integrity: 'sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==',
+          dev: true,
+        },
+      },
+    }),
+  })
+
+  const arb = new Arborist({
+    path,
+    registry: 'https://registry.npmjs.org',
+    cache: resolve(path, 'cache'),
+    installStrategy: 'linked',
+  })
+  await arb.reify({ installStrategy: 'linked' })
+
+  // Since the node is ideally inert, it should not be installed in node_modules
+  t.throws(
+    () => fs.lstatSync(resolve(path, 'node_modules', 'abbrev')),
+    { code: 'ENOENT' },
+    'ideally inert node should not be installed'
+  )
+  t.end()
+})
+
+t.test('externalOptionalDependencies excludes ideally inert optional node with installStrategy linked', async t => {
+  const testDir = t.testdir({
+    'package.json': JSON.stringify({
+      optionalDependencies: {
+        abbrev: '1.1.1',
+      },
+    }),
+    'package-lock.json': JSON.stringify({
+      lockfileVersion: 2,
+      requires: true,
+      packages: {
+        '': {
+          optionalDependencies: {
+            abbrev: '1.1.1',
+          },
+        },
+        'node_modules/abbrev': {
+          version: '1.1.1',
+          resolved: 'https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz',
+          integrity: 'sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==',
+          dev: true,
+          ideallyInert: true,
+        },
+      },
+      optionalDependencies: {
+        abbrev: {
+          version: '1.1.1',
+          resolved: 'https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz',
+          integrity: 'sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==',
+          dev: true,
+          ideallyInert: true,
+        },
+      },
+    }),
+  })
+
+  const arb = new Arborist({
+    path: testDir,
+    registry: 'https://registry.npmjs.org',
+    cache: resolve(testDir, 'cache'),
+    installStrategy: 'linked',
+  })
+  await arb.reify({ installStrategy: 'linked' })
+
+  // Assert that the optional inert node does not appear in externalOptionalDependencies
+  t.notOk(
+    arb.idealGraph.externalOptionalDependencies &&
+    arb.idealGraph.externalOptionalDependencies.some(n => n && n.name === 'abbrev'),
+    'ideally inert optional dependency should not appear in externalOptionalDependencies'
+  )
+
+  // And verify that it is not installed on disk
+  t.throws(
+    () => fs.lstatSync(resolve(testDir, 'node_modules', 'abbrev')),
+    { code: 'ENOENT' },
+    'ideally inert optional node should not be installed'
+  )
+
+  t.end()
+})
+
+t.test('ideally inert due to platform mismatch using optional dependency', async t => {
+  const testDir = t.testdir({
+    'package.json': JSON.stringify({
+      name: 'platform-test',
+      version: '1.0.0',
+      optionalDependencies: {
+        'platform-specifying-test-package': 'file:platform-specifying-test-package',
+      },
+    }, null, 2),
+    'platform-specifying-test-package': {
+      'package.json': JSON.stringify({
+        name: 'platform-specifying-test-package',
+        version: '1.0.0',
+        // Declare an OS that doesn't match current platform
+        os: ['woo'],
+      }, null, 2),
+    },
+  })
+
+  const arb = new Arborist({
+    audit: false,
+    path: testDir,
+    os: process.platform,
+  })
+
+  // The platform check will fail for the optional dependency, and the optional failure handler should mark the node as ideally inert.
+  const tree = await arb.reify()
+  await arb.reify()
+
+  // In the ideal tree, the dependency should be present and marked as ideally inert.
+  const dep = tree.children.get('platform-specifying-test-package')
+  t.ok(dep, 'platform-specifying-test-package node exists in the ideal tree')
+  t.ok(dep.ideallyInert, 'node is marked as ideally inert due to platform mismatch')
+
+  // Verify that the dependency is not installed on disk.
+  t.throws(
+    () => fs.statSync(join(testDir, 'node_modules', 'platform-specifying-test-package')),
+    { code: 'ENOENT' },
+    'platform-specifying-test-package is not installed on disk'
+  )
 })
